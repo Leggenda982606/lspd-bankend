@@ -4,585 +4,704 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 require('dotenv').config();
 
 const app = express();
+const PORT = process.env.PORT || 5000;
 
-// Middleware
+// Security Middleware
+app.use(helmet());
 app.use(cors({
     origin: process.env.FRONTEND_URL || 'http://localhost:3000',
     credentials: true
 }));
 
-app.use(express.json());
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100,
-    message: 'Too many requests from this IP'
-});
-app.use('/api/', limiter);
-
-// Enhanced login rate limiting
+// Rate Limiting
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 5,
-    message: 'Too many login attempts, please try again later'
+    max: 5, // limit each IP to 5 requests per windowMs
+    message: { error: 'Too many login attempts, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
 });
 
-// ================================
-// DATABASE MODELS
-// ================================
+// Body Parser
+app.use(express.json({ limit: '10mb' }));
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+})
+.then(() => console.log('✅ Connected to MongoDB'))
+.catch(err => console.error('❌ MongoDB connection error:', err));
+
+// Rank Schema
+const rankSchema = new mongoose.Schema({
+    name: { type: String, required: true, unique: true },
+    level: { type: Number, required: true, unique: true },
+    canManage: [{ type: Number }], // Array of rank levels this rank can manage
+    permissions: {
+        viewReports: { type: Boolean, default: true },
+        createReports: { type: Boolean, default: true },
+        managePersonnel: { type: Boolean, default: false },
+        adminPanel: { type: Boolean, default: false },
+        manageRanks: { type: Boolean, default: false },
+        viewDisciplinary: { type: Boolean, default: false },
+        issueDisciplinary: { type: Boolean, default: false }
+    },
+    createdAt: { type: Date, default: Date.now }
+});
 
 // User Schema
 const userSchema = new mongoose.Schema({
-    badgeNumber: {
-        type: String,
-        required: true,
-        unique: true,
-        match: /^[A-Z]{2}-\d{4}$/ // Format: LS-1234
-    },
-    email: {
-        type: String,
-        required: true,
-        unique: true,
-        lowercase: true
-    },
-    password: {
-        type: String,
-        required: true,
-        minlength: 6
-    },
-    firstName: {
-        type: String,
-        required: true,
-        trim: true
-    },
-    lastName: {
-        type: String,
-        required: true,
-        trim: true
-    },
-    rank: {
-        type: String,
-        enum: ['Officer', 'Sergeant', 'Lieutenant', 'Captain', 'Deputy Chief', 'Commissioner'],
-        default: 'Officer'
-    },
-    department: {
-        type: String,
-        enum: ['Traffic', 'Detective', 'SWAT', 'K9', 'Air Support', 'Marine', 'Internal Affairs', 'Motorcycle'],
-        required: true
-    },
-    status: {
-        type: String,
-        enum: ['Active', 'Inactive', 'Suspended', 'LOA'],
-        default: 'Active'
-    },
-    permissions: [{
-        type: String,
-        enum: ['dashboard', 'reports', 'evidence', 'personnel', 'admin', 'dispatch', 'armory']
-    }],
-    profileImage: {
-        type: String,
-        default: ''
-    },
-    joinDate: {
-        type: Date,
-        default: Date.now
-    },
-    lastLogin: {
-        type: Date
-    },
-    loginHistory: [{
-        timestamp: Date,
-        ip: String,
-        userAgent: String
-    }],
-    isAdmin: {
-        type: Boolean,
-        default: false
-    }
-}, {
-    timestamps: true
+    email: { type: String, required: true, unique: true },
+    badge: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    firstName: { type: String, required: true },
+    lastName: { type: String, required: true },
+    rank: { type: mongoose.Schema.Types.ObjectId, ref: 'Rank', required: true },
+    department: { type: String, default: 'Patrol' },
+    shift: { type: String, default: 'Day' },
+    status: { type: String, enum: ['Active', 'Inactive', 'Suspended'], default: 'Active' },
+    hireDate: { type: Date, default: Date.now },
+    lastLogin: { type: Date },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    createdAt: { type: Date, default: Date.now }
 });
 
 // Report Schema
 const reportSchema = new mongoose.Schema({
-    reportNumber: {
-        type: String,
-        required: true,
-        unique: true
-    },
-    author: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        required: true
-    },
-    title: {
-        type: String,
-        required: true
-    },
-    type: {
-        type: String,
-        enum: ['Arrest', 'Citation', 'Incident', 'Investigation', 'Use of Force', 'Property', 'Other'],
-        required: true
-    },
-    priority: {
-        type: String,
-        enum: ['Low', 'Medium', 'High', 'Critical'],
-        default: 'Medium'
-    },
-    location: {
-        type: String,
-        required: true
-    },
-    suspects: [{
-        name: String,
-        age: Number,
-        description: String,
-        charges: [String]
-    }],
-    victims: [{
-        name: String,
-        age: Number,
-        description: String
-    }],
-    witnesses: [{
-        name: String,
-        contact: String,
-        statement: String
-    }],
-    narrative: {
-        type: String,
-        required: true
-    },
+    reportNumber: { type: String, required: true, unique: true },
+    title: { type: String, required: true },
+    type: { type: String, required: true, enum: ['Incident', 'Traffic', 'Arrest', 'Investigation', 'Other'] },
+    priority: { type: String, enum: ['Low', 'Medium', 'High', 'Critical'], default: 'Medium' },
+    description: { type: String, required: true },
+    location: { type: String, required: true },
+    date: { type: Date, required: true },
+    status: { type: String, enum: ['Draft', 'Submitted', 'Under Review', 'Approved', 'Rejected'], default: 'Draft' },
+    officerInCharge: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    supervisingOfficer: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     evidence: [{
-        type: String,
-        description: String,
-        collectedBy: String,
-        timestamp: Date
+        type: { type: String },
+        description: { type: String },
+        attachmentUrl: { type: String }
     }],
-    status: {
-        type: String,
-        enum: ['Draft', 'Submitted', 'Under Review', 'Approved', 'Rejected'],
-        default: 'Draft'
-    },
-    reviewedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User'
-    },
-    reviewNotes: String
-}, {
-    timestamps: true
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now }
 });
 
-// Notification Schema
-const notificationSchema = new mongoose.Schema({
-    recipient: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        required: true
-    },
-    sender: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User'
-    },
-    title: {
-        type: String,
-        required: true
-    },
-    message: {
-        type: String,
-        required: true
-    },
-    type: {
-        type: String,
-        enum: ['info', 'warning', 'success', 'error', 'system'],
-        default: 'info'
-    },
-    read: {
-        type: Boolean,
-        default: false
-    },
-    priority: {
-        type: String,
-        enum: ['low', 'medium', 'high', 'urgent'],
-        default: 'medium'
-    }
-}, {
-    timestamps: true
+// Disciplinary Schema
+const disciplinarySchema = new mongoose.Schema({
+    caseNumber: { type: String, required: true, unique: true },
+    officer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    type: { type: String, required: true, enum: ['Warning', 'Reprimand', 'Suspension', 'Termination', 'Commendation'] },
+    reason: { type: String, required: true },
+    description: { type: String, required: true },
+    issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    severity: { type: String, enum: ['Minor', 'Major', 'Severe'], default: 'Minor' },
+    status: { type: String, enum: ['Active', 'Resolved', 'Appealed'], default: 'Active' },
+    dateIssued: { type: Date, default: Date.now },
+    expiryDate: { type: Date },
+    createdAt: { type: Date, default: Date.now }
+});
+
+// Rules Schema
+const ruleSchema = new mongoose.Schema({
+    section: { type: String, required: true },
+    title: { type: String, required: true },
+    content: { type: String, required: true },
+    order: { type: Number, required: true },
+    lastUpdated: { type: Date, default: Date.now },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
 });
 
 // Models
 const User = mongoose.model('User', userSchema);
+const Rank = mongoose.model('Rank', rankSchema);
 const Report = mongoose.model('Report', reportSchema);
-const Notification = mongoose.model('Notification', notificationSchema);
+const Disciplinary = mongoose.model('Disciplinary', disciplinarySchema);
+const Rule = mongoose.model('Rule', ruleSchema);
 
-// ================================
-// MIDDLEWARE FUNCTIONS
-// ================================
-
-// JWT Authentication Middleware
+// Auth Middleware
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
     if (!token) {
-        return res.status(401).json({ message: 'Access token required' });
+        return res.status(401).json({ error: 'Access token required' });
     }
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.userId).select('-password');
-        
+        const user = await User.findById(decoded.id).populate('rank');
         if (!user) {
-            return res.status(401).json({ message: 'User not found' });
+            return res.status(401).json({ error: 'User not found' });
         }
-        
-        if (user.status !== 'Active') {
-            return res.status(403).json({ message: 'Account is not active' });
-        }
-
         req.user = user;
         next();
     } catch (error) {
-        return res.status(403).json({ message: 'Invalid token' });
+        return res.status(403).json({ error: 'Invalid token' });
     }
 };
 
-// Admin Authorization Middleware
-const requireAdmin = (req, res, next) => {
-    if (!req.user.isAdmin) {
-        return res.status(403).json({ message: 'Admin access required' });
-    }
-    next();
-};
-
-// Permission Middleware
+// Permission Check Middleware
 const requirePermission = (permission) => {
     return (req, res, next) => {
-        if (!req.user.permissions.includes(permission) && !req.user.isAdmin) {
-            return res.status(403).json({ message: `Permission '${permission}' required` });
+        if (!req.user.rank.permissions[permission]) {
+            return res.status(403).json({ error: 'Insufficient permissions' });
         }
         next();
     };
 };
 
-// ================================
-// UTILITY FUNCTIONS
-// ================================
-
-// Generate Badge Number
-const generateBadgeNumber = async () => {
-    let badgeNumber;
-    let exists = true;
-    
-    while (exists) {
-        const randomNum = Math.floor(Math.random() * 9000) + 1000;
-        badgeNumber = `LS-${randomNum}`;
-        exists = await User.findOne({ badgeNumber });
-    }
-    
-    return badgeNumber;
-};
-
-// Generate Report Number
-const generateReportNumber = async () => {
-    const today = new Date();
-    const year = today.getFullYear();
-    const month = String(today.getMonth() + 1).padStart(2, '0');
-    const day = String(today.getDate()).padStart(2, '0');
-    
-    const prefix = `${year}${month}${day}`;
-    
-    const count = await Report.countDocuments({
-        reportNumber: { $regex: `^${prefix}` }
-    });
-    
-    const sequence = String(count + 1).padStart(4, '0');
-    return `${prefix}-${sequence}`;
-};
-
-// Send Notification
-const sendNotification = async (recipientId, title, message, type = 'info', senderId = null) => {
+// Initialize Default Data
+async function initializeData() {
     try {
-        const notification = new Notification({
-            recipient: recipientId,
-            sender: senderId,
-            title,
-            message,
-            type
-        });
-        await notification.save();
-        return notification;
+        // Create default ranks if they don't exist
+        const rankCount = await Rank.countDocuments();
+        if (rankCount === 0) {
+            const defaultRanks = [
+                {
+                    name: 'Cadet',
+                    level: 1,
+                    canManage: [],
+                    permissions: {
+                        viewReports: true,
+                        createReports: true,
+                        managePersonnel: false,
+                        adminPanel: false,
+                        manageRanks: false,
+                        viewDisciplinary: false,
+                        issueDisciplinary: false
+                    }
+                },
+                {
+                    name: 'Officer',
+                    level: 2,
+                    canManage: [1],
+                    permissions: {
+                        viewReports: true,
+                        createReports: true,
+                        managePersonnel: false,
+                        adminPanel: false,
+                        manageRanks: false,
+                        viewDisciplinary: false,
+                        issueDisciplinary: false
+                    }
+                },
+                {
+                    name: 'Corporal',
+                    level: 3,
+                    canManage: [1, 2],
+                    permissions: {
+                        viewReports: true,
+                        createReports: true,
+                        managePersonnel: true,
+                        adminPanel: false,
+                        manageRanks: false,
+                        viewDisciplinary: true,
+                        issueDisciplinary: false
+                    }
+                },
+                {
+                    name: 'Sergeant',
+                    level: 4,
+                    canManage: [1, 2, 3],
+                    permissions: {
+                        viewReports: true,
+                        createReports: true,
+                        managePersonnel: true,
+                        adminPanel: false,
+                        manageRanks: false,
+                        viewDisciplinary: true,
+                        issueDisciplinary: true
+                    }
+                },
+                {
+                    name: 'Lieutenant',
+                    level: 5,
+                    canManage: [1, 2, 3, 4],
+                    permissions: {
+                        viewReports: true,
+                        createReports: true,
+                        managePersonnel: true,
+                        adminPanel: true,
+                        manageRanks: false,
+                        viewDisciplinary: true,
+                        issueDisciplinary: true
+                    }
+                },
+                {
+                    name: 'Captain',
+                    level: 6,
+                    canManage: [1, 2, 3, 4, 5],
+                    permissions: {
+                        viewReports: true,
+                        createReports: true,
+                        managePersonnel: true,
+                        adminPanel: true,
+                        manageRanks: true,
+                        viewDisciplinary: true,
+                        issueDisciplinary: true
+                    }
+                },
+                {
+                    name: 'Chief',
+                    level: 7,
+                    canManage: [1, 2, 3, 4, 5, 6],
+                    permissions: {
+                        viewReports: true,
+                        createReports: true,
+                        managePersonnel: true,
+                        adminPanel: true,
+                        manageRanks: true,
+                        viewDisciplinary: true,
+                        issueDisciplinary: true
+                    }
+                }
+            ];
+
+            await Rank.insertMany(defaultRanks);
+            console.log('✅ Default ranks created');
+        }
+
+        // Create default admin user
+        const userCount = await User.countDocuments();
+        if (userCount === 0) {
+            const chiefRank = await Rank.findOne({ name: 'Chief' });
+            const hashedPassword = await bcrypt.hash('admin123', 10);
+            const badge = `LS-${Math.floor(1000 + Math.random() * 9000)}`;
+            
+            const adminUser = new User({
+                email: 'admin@lspd.gov',
+                badge: badge,
+                password: hashedPassword,
+                firstName: 'Admin',
+                lastName: 'Chief',
+                rank: chiefRank._id,
+                department: 'Administration',
+                shift: 'All'
+            });
+
+            await adminUser.save();
+            console.log(`🔑 Default admin created! Badge: ${badge}`);
+        }
+
+        // Create default rules
+        const ruleCount = await Rule.countDocuments();
+        if (ruleCount === 0) {
+            const defaultRules = [
+                {
+                    section: 'General Conduct',
+                    title: 'Professional Behavior',
+                    content: 'All officers must maintain professional conduct at all times while on duty.',
+                    order: 1
+                },
+                {
+                    section: 'General Conduct',
+                    title: 'Uniform Standards',
+                    content: 'Officers must wear proper uniform and maintain neat appearance.',
+                    order: 2
+                },
+                {
+                    section: 'Radio Protocol',
+                    title: 'Clear Communication',
+                    content: 'Use clear, concise language when communicating via radio.',
+                    order: 3
+                },
+                {
+                    section: 'Evidence Handling',
+                    title: 'Chain of Custody',
+                    content: 'Maintain proper chain of custody for all evidence collected.',
+                    order: 4
+                }
+            ];
+
+            await Rule.insertMany(defaultRules);
+            console.log('✅ Default rules created');
+        }
+
     } catch (error) {
-        console.error('Error sending notification:', error);
+        console.error('Error initializing data:', error);
     }
-};
+}
 
-// ================================
-// ROUTES
-// ================================
-
-// Health check
+// Health Check
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', message: 'LSPD Backend is running!' });
 });
 
-// Login
+// AUTH ROUTES
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
     try {
-        const { badgeNumber, password } = req.body;
+        const { badge, password } = req.body;
 
-        if (!badgeNumber || !password) {
-            return res.status(400).json({ message: 'Badge number and password are required' });
+        if (!badge || !password) {
+            return res.status(400).json({ error: 'Badge and password are required' });
         }
 
-        const user = await User.findOne({ badgeNumber });
+        const user = await User.findOne({ badge }).populate('rank');
         if (!user) {
-            return res.status(401).json({ message: 'Invalid credentials' });
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         if (user.status !== 'Active') {
-            return res.status(403).json({ message: 'Account is not active' });
+            return res.status(401).json({ error: 'Account is inactive' });
         }
 
-        const isPasswordValid = await bcrypt.compare(password, user.password);
-        if (!isPasswordValid) {
-            return res.status(401).json({ message: 'Invalid credentials' });
+        const isValidPassword = await bcrypt.compare(password, user.password);
+        if (!isValidPassword) {
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
 
-        // Update last login and login history
+        // Update last login
         user.lastLogin = new Date();
-        user.loginHistory.push({
-            timestamp: new Date(),
-            ip: req.ip,
-            userAgent: req.get('User-Agent')
-        });
-        
-        if (user.loginHistory.length > 10) {
-            user.loginHistory = user.loginHistory.slice(-10);
-        }
-        
         await user.save();
 
         const token = jwt.sign(
-            { userId: user._id, badgeNumber: user.badgeNumber },
+            { id: user._id, badge: user.badge },
             process.env.JWT_SECRET,
-            { expiresIn: '24h' }
+            { expiresIn: '8h' }
         );
 
         res.json({
-            message: 'Login successful',
             token,
             user: {
                 id: user._id,
-                badgeNumber: user.badgeNumber,
+                email: user.email,
+                badge: user.badge,
                 firstName: user.firstName,
                 lastName: user.lastName,
                 rank: user.rank,
                 department: user.department,
-                permissions: user.permissions,
-                isAdmin: user.isAdmin
+                shift: user.shift,
+                status: user.status,
+                hireDate: user.hireDate,
+                lastLogin: user.lastLogin
             }
         });
     } catch (error) {
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Register (Admin only)
-app.post('/api/auth/register', authenticateToken, requireAdmin, async (req, res) => {
+// DASHBOARD ROUTES
+app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
-        const {
+        const totalOfficers = await User.countDocuments({ status: 'Active' });
+        const totalReports = await Report.countDocuments();
+        const pendingReports = await Report.countDocuments({ status: { $in: ['Draft', 'Submitted'] } });
+        const activeCases = await Disciplinary.countDocuments({ status: 'Active' });
+
+        const recentReports = await Report.find()
+            .populate('officerInCharge', 'firstName lastName badge')
+            .sort({ createdAt: -1 })
+            .limit(5);
+
+        const recentActivity = await User.find({ lastLogin: { $exists: true } })
+            .populate('rank', 'name')
+            .sort({ lastLogin: -1 })
+            .limit(5);
+
+        res.json({
+            stats: {
+                totalOfficers,
+                totalReports,
+                pendingReports,
+                activeCases
+            },
+            recentReports,
+            recentActivity
+        });
+    } catch (error) {
+        console.error('Dashboard stats error:', error);
+        res.status(500).json({ error: 'Failed to fetch dashboard stats' });
+    }
+});
+
+// PERSONNEL ROUTES
+app.get('/api/personnel', authenticateToken, requirePermission('managePersonnel'), async (req, res) => {
+    try {
+        const personnel = await User.find()
+            .populate('rank', 'name level')
+            .populate('createdBy', 'firstName lastName badge')
+            .sort({ 'rank.level': -1, lastName: 1 });
+
+        res.json(personnel);
+    } catch (error) {
+        console.error('Personnel fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch personnel' });
+    }
+});
+
+app.post('/api/personnel', authenticateToken, requirePermission('managePersonnel'), async (req, res) => {
+    try {
+        const { email, firstName, lastName, rankId, department, shift } = req.body;
+
+        // Validate rank permission
+        const targetRank = await Rank.findById(rankId);
+        if (!targetRank) {
+            return res.status(400).json({ error: 'Invalid rank' });
+        }
+
+        if (!req.user.rank.canManage.includes(targetRank.level) && req.user.rank.level < targetRank.level) {
+            return res.status(403).json({ error: 'Cannot assign this rank' });
+        }
+
+        const badge = `LS-${Math.floor(1000 + Math.random() * 9000)}`;
+        const hashedPassword = await bcrypt.hash('temp123', 10);
+
+        const newUser = new User({
             email,
-            password,
-            firstName,
-            lastName,
-            rank,
-            department,
-            permissions
-        } = req.body;
-
-        if (!email || !password || !firstName || !lastName || !department) {
-            return res.status(400).json({ message: 'All required fields must be provided' });
-        }
-
-        if (password.length < 6) {
-            return res.status(400).json({ message: 'Password must be at least 6 characters' });
-        }
-
-        const existingUser = await User.findOne({ email });
-        if (existingUser) {
-            return res.status(400).json({ message: 'User with this email already exists' });
-        }
-
-        const badgeNumber = await generateBadgeNumber();
-        const hashedPassword = await bcrypt.hash(password, 12);
-
-        const user = new User({
-            badgeNumber,
-            email: email.toLowerCase(),
+            badge,
             password: hashedPassword,
             firstName,
             lastName,
-            rank: rank || 'Officer',
+            rank: rankId,
             department,
-            permissions: permissions || ['dashboard']
+            shift,
+            createdBy: req.user._id
         });
 
-        await user.save();
-
-        await sendNotification(
-            user._id,
-            'Welcome to LSPD System',
-            `Welcome to the LSPD digital system. Your badge number is ${badgeNumber}.`,
-            'success'
-        );
+        await newUser.save();
+        await newUser.populate('rank', 'name level');
 
         res.status(201).json({
-            message: 'User created successfully',
-            user: {
-                id: user._id,
-                badgeNumber: user.badgeNumber,
-                email: user.email,
-                firstName: user.firstName,
-                lastName: user.lastName,
-                rank: user.rank,
-                department: user.department
-            }
+            message: 'Officer created successfully',
+            user: newUser,
+            temporaryPassword: 'temp123'
         });
     } catch (error) {
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Personnel creation error:', error);
+        if (error.code === 11000) {
+            res.status(400).json({ error: 'Email already exists' });
+        } else {
+            res.status(500).json({ error: 'Failed to create officer' });
+        }
     }
 });
 
-// Get current user profile
-app.get('/api/user/profile', authenticateToken, async (req, res) => {
+// RANKS ROUTES
+app.get('/api/ranks', authenticateToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id).select('-password');
-        res.json(user);
+        const ranks = await Rank.find().sort({ level: 1 });
+        res.json(ranks);
     } catch (error) {
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Ranks fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch ranks' });
     }
 });
 
-// Get dashboard stats
-app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
+app.post('/api/ranks', authenticateToken, requirePermission('manageRanks'), async (req, res) => {
     try {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        const { name, level, canManage, permissions } = req.body;
+        
+        const newRank = new Rank({
+            name,
+            level,
+            canManage,
+            permissions
+        });
 
-        const stats = {
-            totalOfficers: await User.countDocuments({ status: 'Active' }),
-            onDutyOfficers: Math.floor(Math.random() * 50) + 20, // Simulated
-            reportsToday: await Report.countDocuments({
-                createdAt: { $gte: today }
-            }),
-            pendingReports: await Report.countDocuments({
-                status: { $in: ['Draft', 'Submitted', 'Under Review'] }
-            })
-        };
-
-        res.json(stats);
+        await newRank.save();
+        res.status(201).json(newRank);
     } catch (error) {
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Rank creation error:', error);
+        if (error.code === 11000) {
+            res.status(400).json({ error: 'Rank name or level already exists' });
+        } else {
+            res.status(500).json({ error: 'Failed to create rank' });
+        }
     }
 });
 
-// Get notifications
-app.get('/api/notifications', authenticateToken, async (req, res) => {
+// REPORTS ROUTES
+app.get('/api/reports', authenticateToken, async (req, res) => {
     try {
-        const notifications = await Notification.find({ recipient: req.user._id })
-            .populate('sender', 'badgeNumber firstName lastName')
+        const { page = 1, limit = 10, status, type } = req.query;
+        const query = {};
+        
+        if (status) query.status = status;
+        if (type) query.type = type;
+
+        const reports = await Report.find(query)
+            .populate('officerInCharge', 'firstName lastName badge')
+            .populate('supervisingOfficer', 'firstName lastName badge')
             .sort({ createdAt: -1 })
-            .limit(20);
+            .limit(limit * 1)
+            .skip((page - 1) * limit);
 
-        const unreadCount = await Notification.countDocuments({
-            recipient: req.user._id,
-            read: false
-        });
+        const total = await Report.countDocuments(query);
 
         res.json({
-            notifications,
-            unreadCount
+            reports,
+            totalPages: Math.ceil(total / limit),
+            currentPage: page,
+            total
         });
     } catch (error) {
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Reports fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch reports' });
     }
 });
 
-// Get all users (Admin only)
-app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/reports', authenticateToken, async (req, res) => {
     try {
-        const users = await User.find()
-            .select('-password')
-            .sort({ lastName: 1, firstName: 1 });
+        const { title, type, priority, description, location, date } = req.body;
+        
+        const reportNumber = `RPT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+        
+        const newReport = new Report({
+            reportNumber,
+            title,
+            type,
+            priority,
+            description,
+            location,
+            date: new Date(date),
+            officerInCharge: req.user._id
+        });
 
-        res.json(users);
+        await newReport.save();
+        await newReport.populate('officerInCharge', 'firstName lastName badge');
+
+        res.status(201).json(newReport);
     } catch (error) {
-        res.status(500).json({ message: 'Server error', error: error.message });
+        console.error('Report creation error:', error);
+        res.status(500).json({ error: 'Failed to create report' });
     }
 });
 
-// ================================
-// DATABASE CONNECTION & SERVER
-// ================================
-
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-    .then(() => {
-        console.log('✅ Connected to MongoDB');
-        createDefaultAdmin();
-    })
-    .catch((error) => {
-        console.error('❌ MongoDB connection error:', error);
-        process.exit(1);
-    });
-
-// Create default admin user
-const createDefaultAdmin = async () => {
+// DISCIPLINARY ROUTES
+app.get('/api/disciplinary', authenticateToken, requirePermission('viewDisciplinary'), async (req, res) => {
     try {
-        const adminExists = await User.findOne({ isAdmin: true });
-        if (!adminExists) {
-            const hashedPassword = await bcrypt.hash('admin123', 12);
-            const badgeNumber = await generateBadgeNumber();
-            
-            const admin = new User({
-                badgeNumber,
-                email: 'admin@lspd.gov',
-                password: hashedPassword,
-                firstName: 'System',
-                lastName: 'Administrator',
-                rank: 'Commissioner',
-                department: 'Internal Affairs',
-                permissions: ['dashboard', 'reports', 'evidence', 'personnel', 'admin', 'dispatch', 'armory'],
-                isAdmin: true
-            });
+        const { page = 1, limit = 10, status, type } = req.query;
+        const query = {};
+        
+        if (status) query.status = status;
+        if (type) query.type = type;
 
-            await admin.save();
-            console.log(`🔑 Default admin created!`);
-            console.log(`Badge: ${badgeNumber}`);
-            console.log(`Email: admin@lspd.gov`);
-            console.log(`Password: admin123`);
-            console.log(`⚠️  CHANGE PASSWORD AFTER FIRST LOGIN!`);
+        const cases = await Disciplinary.find(query)
+            .populate('officer', 'firstName lastName badge')
+            .populate('issuedBy', 'firstName lastName badge')
+            .sort({ createdAt: -1 })
+            .limit(limit * 1)
+            .skip((page - 1) * limit);
+
+        const total = await Disciplinary.countDocuments(query);
+
+        res.json({
+            cases,
+            totalPages: Math.ceil(total / limit),
+            currentPage: page,
+            total
+        });
+    } catch (error) {
+        console.error('Disciplinary fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch disciplinary cases' });
+    }
+});
+
+app.post('/api/disciplinary', authenticateToken, requirePermission('issueDisciplinary'), async (req, res) => {
+    try {
+        const { officerId, type, reason, description, severity, expiryDate } = req.body;
+        
+        const caseNumber = `DSC-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+        
+        const newCase = new Disciplinary({
+            caseNumber,
+            officer: officerId,
+            type,
+            reason,
+            description,
+            severity,
+            issuedBy: req.user._id,
+            expiryDate: expiryDate ? new Date(expiryDate) : undefined
+        });
+
+        await newCase.save();
+        await newCase.populate('officer', 'firstName lastName badge');
+        await newCase.populate('issuedBy', 'firstName lastName badge');
+
+        res.status(201).json(newCase);
+    } catch (error) {
+        console.error('Disciplinary creation error:', error);
+        res.status(500).json({ error: 'Failed to create disciplinary case' });
+    }
+});
+
+// RULES ROUTES
+app.get('/api/rules', authenticateToken, async (req, res) => {
+    try {
+        const rules = await Rule.find()
+            .populate('updatedBy', 'firstName lastName badge')
+            .sort({ section: 1, order: 1 });
+
+        res.json(rules);
+    } catch (error) {
+        console.error('Rules fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch rules' });
+    }
+});
+
+app.post('/api/rules', authenticateToken, requirePermission('adminPanel'), async (req, res) => {
+    try {
+        const { section, title, content, order } = req.body;
+        
+        const newRule = new Rule({
+            section,
+            title,
+            content,
+            order,
+            updatedBy: req.user._id
+        });
+
+        await newRule.save();
+        await newRule.populate('updatedBy', 'firstName lastName badge');
+
+        res.status(201).json(newRule);
+    } catch (error) {
+        console.error('Rule creation error:', error);
+        res.status(500).json({ error: 'Failed to create rule' });
+    }
+});
+
+app.put('/api/rules/:id', authenticateToken, requirePermission('adminPanel'), async (req, res) => {
+    try {
+        const { section, title, content, order } = req.body;
+        
+        const rule = await Rule.findByIdAndUpdate(
+            req.params.id,
+            {
+                section,
+                title,
+                content,
+                order,
+                lastUpdated: new Date(),
+                updatedBy: req.user._id
+            },
+            { new: true }
+        ).populate('updatedBy', 'firstName lastName badge');
+
+        if (!rule) {
+            return res.status(404).json({ error: 'Rule not found' });
         }
-    } catch (error) {
-        console.error('Error creating default admin:', error);
-    }
-};
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-    console.error(error);
-    res.status(500).json({ message: 'Something went wrong!' });
+        res.json(rule);
+    } catch (error) {
+        console.error('Rule update error:', error);
+        res.status(500).json({ error: 'Failed to update rule' });
+    }
 });
 
 // Start server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`🚀 LSPD Backend running on port ${PORT}`);
+    await initializeData();
+    console.log('Your service is live 🎉');
 });
 
 module.exports = app;
